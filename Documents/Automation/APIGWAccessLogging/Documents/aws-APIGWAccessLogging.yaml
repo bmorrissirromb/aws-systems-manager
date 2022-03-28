@@ -1,0 +1,137 @@
+apiGWAccessLogging:
+Type: AWS::SSM::Document
+Properties:
+  DocumentType: Automation
+  Name: enable-apigw-access-logging
+  Tags:
+	- Key: "Name"
+	  Value: "enable-apigw-access-logging"
+  Content:
+	description: |
+	  ### Document name - enable-apigw-access-logging
+	  ## What does this document do?
+	  This runbook updates the access logging settings for an Amazon API Gateway Stage using the [UpdateStage](https://docs.aws.amazon.com/apigateway/api-reference/link-relation/stage-update/) API.
+	  For the access log destination, the document will find or create a log group in the same environment as the Stage with the name `/aws/restapis/{api_id}/{stage_name}`.
+	  If the document creates a new log group, it will also attempt to create a subscription filter for the centralized logging buckets, but only forward PUT/POST requests.
+	  If the document creates a new log group, the log group retention will initially be set to 7 days of retention.
+	  The document uses JSON as the format for access logs.
+	  ## Input Parameters
+	  * StageArn: (Required) Arn of the API GW Stage. Passed in via Config.
+	  * AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf. Set in the Config Rule, passed in via Config.
+	schemaVersion: '0.3'
+	assumeRole: '{{ AutomationAssumeRole }}'
+	parameters:
+	  StageArn:
+		type: String
+		description: (Required) ARN of the API Stage that has a regional endpoint.
+		#allowedPattern: '^[\w+=,.@_-]{1,128}$'  # Allowed pattern breaking testcase
+	  AutomationAssumeRole:
+		type: String
+		description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+		allowedPattern: '^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/[\w+=,.@-]+'
+	mainSteps:
+	  - name: enableAccessLoggingScript
+		action: 'aws:executeScript'
+		timeoutSeconds: 600
+		isEnd: true
+		description: Finds or creates a log group and then configures the stage to send Access Logs to that log group.
+		inputs:
+		  Runtime: python3.8
+		  Handler: apigw_handler
+		  InputPayload:
+			StageArn: '{{ StageArn }}'
+		  Script: |
+			import boto3
+			import re
+			def find_or_create_log_group(log_group_name, subscription_destination, retention_days=1, kms_key_id = None):
+			  logs_client = boto3.client('logs')
+			  response             = logs_client.describe_log_groups(
+				logGroupNamePrefix = log_group_name
+			  )
+			  try:
+				if response.get('logGroups'):
+				  return 0
+				else:
+				  try:
+					create_args = {
+					  'logGroupName': log_group_name
+					}
+					if kms_key_id:
+					  create_args['kmsKeyId'] = kms_key_id
+					  response = logs_client.create_log_group(**create_args)
+				  except Exception as e:
+					return f"Error while attempting to create log group {log_group_name}. {e}"
+				  try:
+					logs_client.put_retention_policy(
+					  logGroupName    = log_group_name,
+					  retentionInDays = retention_days
+					)
+				  except Exception as e:
+					return f"Error -- could not update retention days to specified value of {retention_days} for log group {log_group_name}. {e}"
+				  if subscription_destination:
+                    try: 
+                        logs_client.put_subscription_filter(
+                          logGroupName   = log_group_name,
+                          filterName     = 'Destination',
+                          filterPattern  = '{ $.httpMethod = PUT || $.httpMethod = POST }',
+                          destinationArn = subscription_destination
+                        )
+                    except Exception as e:
+                        return f"Error -- could not put subscription filter for log group {log_group_name}. {e}"
+			  except Exception as e: 
+				return f"Error -- unable to find/create log group with name {log_group_name}. {e}"
+			  return 0
+			def apigw_handler(event, context):
+			  # Clients
+			  config_client = boto3.client("config")
+			  api_gw_client = boto3.client('apigateway')
+			  # Event data
+			  stage_id = event["StageArn"]
+			  # Query config history to get Stage details
+			  stage_response = config_client.get_resource_config_history(resourceType="AWS::ApiGateway::Stage", resourceId=stage_id, limit=1)
+			  stage_name = stage_response["configurationItems"][0]["resourceName"]
+			  log_region = stage_response["configurationItems"][0]['awsRegion']
+			  log_account = stage_response["configurationItems"][0]['accountId']
+			  api_id = ""
+			  rest_api_arn = stage_response["configurationItems"][0]["relationships"][0]["resourceId"]
+			  rest_api_arn_pattern = "^arn:.*:/restapis/(.*)"
+			  rest_api_match = re.match(rest_api_arn_pattern, rest_api_arn)
+			  if not rest_api_match:
+				raise Exception("GIVEN AMAZON API GATEWAY STAGE ID IS NOT ASSOCIATED WITH ANY REST API ID.")
+			  api_id = rest_api_match.groups()[0]
+			  # Find or create the log group
+			  my_log_group_name = f'/aws/api-gateway/{api_id}/{stage_name}'
+              subscription_destination = None
+			  log_group_response = find_or_create_log_group(
+				log_group_name           = my_log_group_name,
+				subscription_destination = subscription_destination
+			  )
+			  if 0 == log_group_response: 
+				# Configure the API Gateway to send to the stage
+				dest_arn = f'arn:aws:logs:{log_region}:{log_account}:log-group:{my_log_group_name}'
+				json_format_string = "{\"requestId\": \"$context.requestId\", \"ip\": \"$context.identity.sourceIp\", \"caller\": \"$context.identity.caller\", \"user\": \"$context.identity.user\", \"requestTime\": \"$context.requestTime\", \"httpMethod\": \"$context.httpMethod\", \"resourcePath\": \"$context.resourcePath\", \"status\": \"$context.status\", \"protocol\": \"$context.protocol\", \"responseLength\": \"$context.responseLength\"}"
+				stage_response = api_gw_client.update_stage(
+				  restApiId       = api_id,
+				  stageName       = stage_name,
+				  patchOperations = [
+					{
+					  'op': 'add',
+					  'path': '/accessLogSettings/destinationArn',
+					  'value': dest_arn
+					},
+					{
+					  'op': 'add',
+					  'path': '/accessLogSettings/format',
+					  'value': json_format_string
+					}
+				  ]
+				)
+				if stage_response['accessLogSettings']['destinationArn']:
+				  return {
+					"DestinationArn": stage_response['accessLogSettings']['destinationArn'],
+					"StageName"     : stage_response['stageName'],
+				  }
+				else:
+				  raise Exception("ERROR - No Destination ARN was detected for the API Gateway Stage.")
+			  else:
+				raise Exception(f"ERROR - Could not find or create the specified log group. Error message: {log_group_response}")
